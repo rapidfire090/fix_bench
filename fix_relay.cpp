@@ -1,308 +1,326 @@
-#include <iostream>
-#include <thread>
-#include <array>
-#include <vector>
-#include <cstring>
+// fix_relay_v9_tpd.cpp
+// Minimal-diff twin of fix_relay_v9 that uses TCPDirect (zf_*) instead of POSIX sockets.
+// Build this as a separate binary for A/B perf vs your existing Onload sockets build.
+
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
+#include <csignal>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <errno.h>
 #include <fstream>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <unistd.h>
+#include <iostream>
 #include <pthread.h>
 #include <sched.h>
-#include <sys/resource.h>
+#include <string>
+#include <thread>
+#include <vector>
 
-// Onload Extensions
-#include <onload/extensions.h>
+// TCPDirect
+extern "C" {
+#include <zf/zf.h>
+#include <zf/zf_tcp.h>
+}
+
+static std::atomic<bool> g_running{true};
+
+// ---------- tiny helpers ----------
+static inline uint64_t now_ns() {
+  using namespace std::chrono;
+  return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static void pin_to_cpu(int cpu) {
+  if (cpu < 0) return;
+  cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
+  pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
+// ---------- lock-free SPSC ring ----------
+template <typename T, size_t N>
+struct SpscRing {
+  static_assert((N & (N-1)) == 0, "N must be power of two");
+  alignas(64) T buf[N];
+  alignas(64) std::atomic<size_t> head{0};
+  alignas(64) std::atomic<size_t> tail{0};
+
+  bool push(const T& v) {
+    size_t h = head.load(std::memory_order_relaxed);
+    size_t t = tail.load(std::memory_order_acquire);
+    if (((h + 1) & (N-1)) == (t & (N-1))) return false; // full
+    buf[h & (N-1)] = v;
+    head.store(h + 1, std::memory_order_release);
+    return true;
+  }
+  bool pop(T& out) {
+    size_t t = tail.load(std::memory_order_relaxed);
+    size_t h = head.load(std::memory_order_acquire);
+    if (t == h) return false; // empty
+    out = buf[t & (N-1)];
+    tail.store(t + 1, std::memory_order_release);
+    return true;
+  }
+};
 
 struct Message {
-    std::array<char, 1024> data;
-    size_t length;
-    uint64_t recv_end_ns;
+  uint32_t len;
+  uint64_t rx_done_ns;
+  uint64_t send_start_ns;
+  uint64_t send_end_ns;
+  // Big enough for jumbo; adjust if your relay caps at MTU 1500.
+  static constexpr size_t MAX = 9200;
+  uint8_t data[MAX];
 };
 
-struct LogEntry {
-    uint64_t timestamp_ns;
-    uint64_t latency_ns;
-    uint64_t send_latency_ns;
-    uint64_t total_latency_ns;
-    std::array<char, 32> clordid;
+// ---------- CLI (same flags you already use) ----------
+struct Args {
+  std::string listen_ip = "0.0.0.0";
+  uint16_t    listen_port = 9000;
+  std::string fwd_ip = "127.0.0.1";
+  uint16_t    fwd_port = 9001;
+  int rx_cpu = -1;
+  int tx_cpu = -1;
+  bool enable_latency = false;
+  std::string log_path = "";
 };
 
-template <typename T, size_t Capacity>
-class SPSCQueue {
-private:
-    std::array<T, Capacity> buffer;
-    std::atomic<size_t> head{0};
-    std::atomic<size_t> tail{0};
+static void usage(const char* argv0) {
+  std::cerr <<
+    "Usage: " << argv0 << " --listen-ip IP --listen-port P --forward-ip IP --forward-port P\n"
+    "       [--rx-cpu N] [--tx-cpu N] [--latency] [--log FILE]\n";
+}
 
-public:
-    bool push(const T& item) {
-        size_t h = head.load(std::memory_order_relaxed);
-        size_t next = (h + 1) % Capacity;
-        if (next == tail.load(std::memory_order_acquire)) return false;
-        buffer[h] = item;
-        head.store(next, std::memory_order_release);
-        return true;
-    }
+static bool parse_args(int argc, char** argv, Args& a) {
+  for (int i=1;i<argc;i++) {
+    std::string s = argv[i];
+    auto nxt = [&](uint16_t off=1)->const char*{ if (i+off>=argc) {usage(argv[0]); exit(2);} return argv[i+off]; };
+    if (s=="--listen-ip") a.listen_ip = nxt();
+    else if (s=="--listen-port") a.listen_port = (uint16_t)atoi(nxt());
+    else if (s=="--forward-ip") a.fwd_ip = nxt();
+    else if (s=="--forward-port") a.fwd_port = (uint16_t)atoi(nxt());
+    else if (s=="--rx-cpu") a.rx_cpu = atoi(nxt());
+    else if (s=="--tx-cpu") a.tx_cpu = atoi(nxt());
+    else if (s=="--latency") a.enable_latency = true;
+    else if (s=="--log") a.log_path = nxt();
+    else { usage(argv[0]); return false; }
+  }
+  return true;
+}
 
-    bool pop(T& item) {
-        size_t t = tail.load(std::memory_order_relaxed);
-        if (t == head.load(std::memory_order_acquire)) return false;
-        item = buffer[t];
-        tail.store((t + 1) % Capacity, std::memory_order_release);
-        return true;
-    }
+// ---------- TCPDirect wrappers (per-thread stack + muxer) ----------
+struct TpdStack {
+  zf_attr*  attr  = nullptr;
+  zf_stack* stack = nullptr;
+  zf_muxer* mux   = nullptr;
+
+  void init() {
+    int rc;
+    if ((rc = zf_attr_alloc(&attr)) != 0) { fprintf(stderr, "zf_attr_alloc rc=%d\n", rc); exit(1); }
+    // attr tuning here if needed (e.g., interface selection)
+    if ((rc = zf_stack_alloc(attr, &stack)) != 0) { fprintf(stderr, "zf_stack_alloc rc=%d\n", rc); exit(1); }
+    if ((rc = zf_muxer_alloc(stack, &mux)) != 0) { fprintf(stderr, "zf_muxer_alloc rc=%d\n", rc); exit(1); }
+  }
+  ~TpdStack() {
+    if (mux) zf_muxer_free(mux);
+    if (stack) zf_stack_free(stack);
+    if (attr) zf_attr_free(attr);
+  }
 };
 
-SPSCQueue<Message, 256> queue;
-SPSCQueue<LogEntry, 4096> log_queue;
-
-std::atomic<bool> enable_latency{false};
-std::atomic<int> debug_level{0};
-std::string log_file_path;
-int log_flush_interval_ms = 50;
-
-std::string extract_fix_tag11(const char* data, size_t len) {
-    std::string msg(data, len);
-    size_t pos = msg.find("11=");
-    if (pos == std::string::npos) return "";
-    size_t end = msg.find('\x01', pos);
-    if (end == std::string::npos) return msg.substr(pos + 3);
-    return msg.substr(pos + 3, end - pos - 3);
+static sockaddr_in mk_sockaddr(const std::string& ip, uint16_t port) {
+  sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port);
+  if (inet_pton(AF_INET, ip.c_str(), &a.sin_addr) != 1) {
+    fprintf(stderr, "bad ip: %s\n", ip.c_str()); exit(2);
+  }
+  return a;
 }
 
-void log_writer_thread(const std::string& file_path, int flush_interval_ms) {
-    sched_param param{};
-    param.sched_priority = 0;
-    pthread_setschedparam(pthread_self(), SCHED_OTHER, &param);
+// RX endpoint = accepted inbound
+struct RxEndpoint {
+  zftl*   listener = nullptr;
+  zft*    in       = nullptr;
+};
 
-    std::ofstream out(file_path, std::ios::out | std::ios::app);
-    if (!out) {
-        std::cerr << "Failed to open log file: " << file_path << std::endl;
-        return;
-    }
+// TX endpoint = connected outbound
+struct TxEndpoint {
+  zft_handle* h = nullptr; // handle until connected
+  zft*        z = nullptr; // becomes valid after connect completes
+};
 
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(flush_interval_ms));
-        LogEntry entry;
-        while (log_queue.pop(entry)) {
-            out << entry.timestamp_ns << ","
-                << entry.latency_ns << ","
-                << entry.send_latency_ns << ","
-                << entry.total_latency_ns << ","
-                << entry.clordid.data() << "\n";
-        }
-        out.flush();
+// ---------- threads ----------
+struct Shared {
+  SpscRing<Message, 1<<14> ring; // 16K slots
+  std::atomic<bool> have_peer{false};
+  std::atomic<bool> tx_ready{false};
+};
+
+static void rx_thread(const Args a, Shared* sh) {
+  pin_to_cpu(a.rx_cpu);
+
+  TpdStack t;
+  t.init();
+
+  // Listen inbound
+  int rc;
+  RxEndpoint ep{};
+  sockaddr_in laddr = mk_sockaddr(a.listen_ip, a.listen_port);
+  if ((rc = zftl_listen(t.stack, reinterpret_cast<const struct sockaddr*>(&laddr),
+                        sizeof(laddr), 128, &ep.listener)) != 0) {
+    fprintf(stderr, "zftl_listen rc=%d\n", rc); return;
+  }
+  zf_waitable* lw = zftl_to_waitable(ep.listener);
+  zf_muxer_set_interest(t.mux, lw, EPOLLIN);
+
+  // Wait for inbound connection
+  while (g_running && ep.in == nullptr) {
+    zf_muxer_wait(t.mux, nullptr, 0, 100);
+    if (zf_muxer_is_set(t.mux, lw, EPOLLIN)) {
+      if ((rc = zftl_accept(ep.listener, &ep.in)) != 0) {
+        if (rc == -EAGAIN) continue;
+        fprintf(stderr, "zftl_accept rc=%d\n", rc); return;
+      }
     }
+  }
+  if (!g_running) return;
+
+  zf_waitable* iw = zft_to_waitable(ep.in);
+  zf_muxer_set_interest(t.mux, iw, EPOLLIN | EPOLLERR);
+  sh->have_peer.store(true, std::memory_order_release);
+
+  // Receive loop
+  while (g_running) {
+    // Wait for data
+    int ne = zf_muxer_wait(t.mux, nullptr, 0, 1000);
+    (void)ne;
+
+    // Read
+    for (;;) {
+      ssize_t n;
+#if defined(ZF_HAS_ZFT_RECV)
+      n = zft_recv(ep.in, nullptr, 0, 0); // probe
+      if (n == -EAGAIN) break;
+      if (n <= 0) { g_running=false; break; }
+      Message m{};
+      if ((size_t)n > Message::MAX) { fprintf(stderr, "oversize %zd\n", n); g_running=false; break; }
+      // real read
+      n = zft_recv(ep.in, m.data, Message::MAX, 0);
+      if (n <= 0) { g_running=false; break; }
+      m.len = (uint32_t)n;
+      if (a.enable_latency) m.rx_done_ns = now_ns();
+      while (!sh->ring.push(m) && g_running) { /* backoff */ }
+#else
+      // zc path (copy into our buffer)
+      struct iovec iov[32]; int iovcnt = 32;
+      n = zft_recv_zc(ep.in, iov, &iovcnt, 0);
+      if (n == -EAGAIN) break;
+      if (n <= 0) { g_running=false; break; }
+      Message m{};
+      size_t need = (size_t)n;
+      if (need > Message::MAX) { fprintf(stderr, "oversize %zu\n", need); g_running=false; break; }
+      size_t off=0;
+      for (int i=0;i<iovcnt && off<need;i++) {
+        size_t cp = std::min(need - off, (size_t)iov[i].iov_len);
+        std::memcpy(m.data + off, iov[i].iov_base, cp);
+        off += cp;
+      }
+      zft_zc_recv_done(ep.in, iov, iovcnt);
+      m.len = (uint32_t)need;
+      if (a.enable_latency) m.rx_done_ns = now_ns();
+      while (!sh->ring.push(m) && g_running) { /* backoff */ }
+#endif
+    }
+  }
 }
 
-// RX: accelerate this thread, move accepted socket into this stack
-void recv_thread(int client_sock) {
-    onload_set_stackname(ONLOAD_THIS_THREAD, ONLOAD_SCOPE_THREAD, "rx_stack");
-    onload_thread_set_spin(ONLOAD_SPIN_ALL, 1);  // optional
+static void tx_thread(const Args a, Shared* sh) {
+  pin_to_cpu(a.tx_cpu);
 
-    // Move accepted socket (created in main) into this thread's Onload stack
-    if (onload_move_fd(client_sock) < 0) {
-        // If move fails (kernel socket / not onload-capable), continue anyway
-        // perror("[recv] onload_move_fd");
+  TpdStack t;
+  t.init();
+
+  // Outbound connect
+  int rc;
+  TxEndpoint ep{};
+  if ((rc = zft_alloc(t.stack, t.attr, &ep.h)) != 0) {
+    fprintf(stderr, "zft_alloc rc=%d\n", rc); return;
+  }
+  sockaddr_in raddr = mk_sockaddr(a.fwd_ip, a.fwd_port);
+  if ((rc = zft_connect(ep.h, reinterpret_cast<const struct sockaddr*>(&raddr), sizeof(raddr))) != 0) {
+    fprintf(stderr, "zft_connect rc=%d\n", rc); return;
+  }
+  // Wait for connect-complete
+  zf_waitable* hw = zft_handle_to_waitable(ep.h);
+  zf_muxer_set_interest(t.mux, hw, EPOLLOUT|EPOLLERR);
+  for (;;) {
+    zf_muxer_wait(t.mux, nullptr, 0, 100);
+    if (zf_muxer_is_set(t.mux, hw, EPOLLOUT)) {
+      if ((rc = zft_handle_to_zft(ep.h, &ep.z)) != 0) {
+        if (rc == -EAGAIN) continue;
+        fprintf(stderr, "zft_handle_to_zft rc=%d\n", rc); return;
+      }
+      break;
     }
+  }
+  zf_waitable* zw = zft_to_waitable(ep.z);
+  zf_muxer_set_interest(t.mux, zw, EPOLLOUT|EPOLLERR);
+  sh->tx_ready.store(true, std::memory_order_release);
 
-    std::cout << "[recv] Thread started" << std::endl;
-    while (true) {
-        Message msg;
-        ssize_t len = recv(client_sock, msg.data.data(), msg.data.size(), 0);
+  // Optional logging
+  std::ofstream log;
+  if (!a.log_path.empty()) log.open(a.log_path, std::ios::out | std::ios::app);
 
-        msg.recv_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+  // Send loop
+  Message m;
+  while (g_running) {
+    if (!sh->ring.pop(m)) { zf_muxer_wait(t.mux, nullptr, 0, 100); continue; }
 
-        if (len <= 0) {
-            if (len == 0)
-                std::cout << "[recv] Client closed connection" << std::endl;
-            else
-                perror("[recv] recv error");
-            break;
+    size_t off = 0;
+    while (off < m.len && g_running) {
+      if (a.enable_latency) m.send_start_ns = now_ns();
+      ssize_t s = zft_send(ep.z, m.data + off, m.len - off, 0);
+      if (s == -EAGAIN) {
+        zf_muxer_wait(t.mux, nullptr, 0, 100);
+        continue;
+      }
+      if (s <= 0) { g_running=false; break; }
+      off += (size_t)s;
+      if (a.enable_latency) {
+        m.send_end_ns = now_ns();
+        if (log.good()) {
+          // CSV: recv_done_ns, send_start_ns, send_end_ns, total_ns
+          uint64_t total = (m.send_end_ns >= m.rx_done_ns) ? (m.send_end_ns - m.rx_done_ns) : 0;
+          log << m.rx_done_ns << "," << m.send_start_ns << "," << m.send_end_ns << "," << total << "\n";
         }
-
-        msg.length = static_cast<size_t>(len);
-        int spin = 0;
-        while (!queue.push(msg)) {
-            if (++spin > 1000) spin = 0;
-        }
+      }
     }
-
-    close(client_sock);
-    std::cout << "[recv] Closed client socket" << std::endl;
+  }
 }
 
-// TX: accelerate this thread; create forward socket in this stack
-void send_thread(const char* forward_ip, int forward_port) {
-    onload_set_stackname(ONLOAD_THIS_THREAD, ONLOAD_SCOPE_THREAD, "tx_stack");
-    onload_thread_set_spin(ONLOAD_SPIN_ALL, 1);  // optional
+// ---------- main ----------
+int main(int argc, char** argv) {
+  Args a;
+  if (!parse_args(argc, argv)) return 2;
 
-    std::cout << "[send] Connecting to " << forward_ip << ":" << forward_port << std::endl;
+  // Ctrl-C
+  std::signal(SIGINT,  [](int){ g_running=false; });
+  std::signal(SIGTERM, [](int){ g_running=false; });
 
-    int forward_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (forward_sock < 0) {
-        perror("[send] socket");
-        return;
-    }
+  // TCPDirect global init (once in the process)
+  int rc;
+  if ((rc = zf_init()) != 0) {
+    std::fprintf(stderr, "zf_init rc=%d\n", rc);
+    return 1;
+  }
 
-    int flag = 1;
-    setsockopt(forward_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+  Shared sh;
 
-    sockaddr_in forward_addr{};
-    forward_addr.sin_family = AF_INET;
-    forward_addr.sin_port = htons(forward_port);
-    inet_pton(AF_INET, forward_ip, &forward_addr.sin_addr);
+  std::thread rxt(rx_thread, a, &sh);
+  std::thread txt(tx_thread, a, &sh);
 
-    if (connect(forward_sock, (sockaddr*)&forward_addr, sizeof(forward_addr)) < 0) {
-        perror("[send] connect");
-        close(forward_sock);
-        return;
-    }
-
-    std::cout << "[send] Connected" << std::endl;
-
-    Message msg;
-    while (true) {
-        int spin = 0;
-        while (!queue.pop(msg)) {
-            if (++spin > 1000) spin = 0;
-        }
-
-        uint64_t send_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-
-        ssize_t sent = send(forward_sock, msg.data.data(), msg.length, 0);
-
-        uint64_t send_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-
-        if (sent < 0) {
-            perror("[send] send");
-            break;
-        }
-
-        if (enable_latency && debug_level == 2) {
-            uint64_t latency = send_start_ns - msg.recv_end_ns;
-            uint64_t send_latency = send_end_ns - send_start_ns;
-            uint64_t total = latency + send_latency;
-
-            std::string clordid_str = extract_fix_tag11(msg.data.data(), msg.length);
-            LogEntry entry{msg.recv_end_ns, latency, send_latency, total};
-            std::strncpy(entry.clordid.data(), clordid_str.c_str(), entry.clordid.size() - 1);
-            log_queue.push(entry);
-        }
-    }
-
-    close(forward_sock);
-    std::cout << "[send] Forward socket closed" << std::endl;
-}
-
-// Sleeper: default (no Onload calls), pinned to its CPU
-void sleeper_thread() {
-    std::cout << "[sleeper] Thread started (sleeping indefinitely)" << std::endl;
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::hours(24));
-    }
-}
-
-int main(int argc, char* argv[]) {
-    if (argc < 8) {
-        std::cerr << "Usage: " << argv[0]
-                  << " <listen_ip> <listen_port> <forward_ip> <forward_port> <rx_cpu> <tx_cpu> <sleep_cpu> "
-                  << "[--measure-latency <log_file> <flush_interval_ms> [--debug-level=2]]" << std::endl;
-        return 1;
-    }
-
-    const char* listen_ip = argv[1];
-    int listen_port = std::stoi(argv[2]);
-    const char* forward_ip = argv[3];
-    int forward_port = std::stoi(argv[4]);
-    int rx_cpu = std::stoi(argv[5]);
-    int tx_cpu = std::stoi(argv[6]);
-    int sleep_cpu = std::stoi(argv[7]);
-
-    for (int i = 8; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--measure-latency" && i + 2 < argc) {
-            enable_latency = true;
-            log_file_path = argv[++i];
-            log_flush_interval_ms = std::stoi(argv[++i]);
-        } else if (arg.rfind("--debug-level=", 0) == 0) {
-            debug_level = std::stoi(arg.substr(14));
-        }
-    }
-
-    if (enable_latency && log_file_path.size() > 0) {
-        std::thread logger(log_writer_thread, log_file_path, log_flush_interval_ms);
-        logger.detach();
-    }
-
-    // Start sleeper and pin it
-    std::thread sleeper(sleeper_thread);
-    {
-        cpu_set_t set_sl;
-        CPU_ZERO(&set_sl);
-        CPU_SET(sleep_cpu, &set_sl);
-        pthread_setaffinity_np(sleeper.native_handle(), sizeof(cpu_set_t), &set_sl);
-    }
-    sleeper.detach();
-
-    int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_sock < 0) {
-        perror("[main] socket");
-        return 1;
-    }
-
-    int opt = 1;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in listen_addr{};
-    listen_addr.sin_family = AF_INET;
-    listen_addr.sin_port = htons(listen_port);
-    inet_pton(AF_INET, listen_ip, &listen_addr.sin_addr);
-
-    if (bind(listen_sock, (sockaddr*)&listen_addr, sizeof(listen_addr)) < 0) {
-        perror("[main] bind");
-        return 1;
-    }
-
-    if (listen(listen_sock, 10) < 0) {
-        perror("[main] listen");
-        return 1;
-    }
-
-    std::cout << "[main] Listening on " << listen_ip << ":" << listen_port << std::endl;
-
-    while (true) {
-        sockaddr_in client_addr{};
-        socklen_t addrlen = sizeof(client_addr);
-        int client_sock = accept(listen_sock, (sockaddr*)&client_addr, &addrlen);
-        if (client_sock >= 0) {
-            std::cout << "[main] Accepted connection" << std::endl;
-
-            // RX thread will move this fd into its own stack
-            std::thread rx(recv_thread, client_sock);
-            cpu_set_t set_rx;
-            CPU_ZERO(&set_rx);
-            CPU_SET(rx_cpu, &set_rx);
-            pthread_setaffinity_np(rx.native_handle(), sizeof(cpu_set_t), &set_rx);
-            rx.detach();
-
-            // TX thread creates its own accelerated socket
-            std::thread tx(send_thread, forward_ip, forward_port);
-            cpu_set_t set_tx;
-            CPU_ZERO(&set_tx);
-            CPU_SET(tx_cpu, &set_tx);
-            pthread_setaffinity_np(tx.native_handle(), sizeof(cpu_set_t), &set_tx);
-            tx.detach();
-        }
-    }
-
-    close(listen_sock);
-    return 0;
+  rxt.join();
+  txt.join();
+  return 0;
 }
